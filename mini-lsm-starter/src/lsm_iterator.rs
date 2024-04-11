@@ -80,10 +80,16 @@ impl<I: StorageIterator> StorageIterator for FusedIterator<I> {
     }
 
     fn key(&self) -> Self::KeyType<'_> {
+        if !self.is_valid() {
+            panic!("invalid access to the underlying iterator");
+        }
         self.iter.key()
     }
 
     fn value(&self) -> &[u8] {
+        if !self.is_valid() {
+            panic!("invalid access to the underlying iterator");
+        }
         self.iter.value()
     }
 
