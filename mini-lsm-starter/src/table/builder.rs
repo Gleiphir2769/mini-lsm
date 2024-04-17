@@ -86,6 +86,8 @@ impl SsTableBuilder {
         block_cache: Option<Arc<BlockCache>>,
         path: impl AsRef<Path>,
     ) -> Result<SsTable> {
+        let first_key = self.first_key.clone();
+        let last_key = self.last_key.clone();
         self.finish_block();
         let mut buf = self.data;
         let meta_offset = buf.len() as u32;
@@ -102,8 +104,8 @@ impl SsTableBuilder {
             block_meta_offset: meta_offset as usize,
             id,
             block_cache,
-            first_key: KeyBytes::from_bytes(Bytes::from(self.first_key)),
-            last_key: KeyBytes::from_bytes(Bytes::from(self.last_key)),
+            first_key: KeyBytes::from_bytes(Bytes::from(first_key)),
+            last_key: KeyBytes::from_bytes(Bytes::from(last_key)),
             bloom: None,
             max_ts: 0,
         })

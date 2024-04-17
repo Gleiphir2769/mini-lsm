@@ -3,10 +3,12 @@
 use std::collections::HashMap;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
+use std::process::id;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
 use anyhow::Result;
+use arc_swap::AsRaw;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use serde_json::map::Entry::Vacant;
@@ -18,11 +20,14 @@ use crate::compact::{
     SimpleLeveledCompactionController, SimpleLeveledCompactionOptions, TieredCompactionController,
 };
 use crate::iterators::merge_iterator::MergeIterator;
+use crate::iterators::two_merge_iterator::TwoMergeIterator;
+use crate::iterators::StorageIterator;
+use crate::key::{Key, KeyBytes, KeySlice};
 use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
-use crate::mem_table::MemTable;
+use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::SsTable;
+use crate::table::{SsTable, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -298,6 +303,22 @@ impl LsmStorageInner {
                 return Ok(Some(value));
             }
         }
+        
+        // find k/v in sst
+        let mut sst_iters = Vec::with_capacity(guard.l0_sstables.len());
+        let key_slice = KeySlice::from_slice(_key);
+        for idx in guard.l0_sstables.iter() {
+            let sst = guard.sstables[idx].clone();
+            if sst.first_key().as_key_slice() <= key_slice || 
+                sst.last_key().as_key_slice() >= key_slice {
+                sst_iters.push(Box::new(
+                    SsTableIterator::create_and_seek_to_key(sst, key_slice)?));
+            }
+        }
+        let iter = MergeIterator::create(sst_iters);
+        if iter.is_valid() && iter.key() == key_slice && !iter.value().is_empty() {
+            return Ok(Some(Bytes::copy_from_slice(iter.value())));
+        }
 
         Ok(None)
     }
@@ -404,15 +425,81 @@ impl LsmStorageInner {
             Arc::clone(&guard)
         };
 
-        let mut iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
-        iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
+        let mut mem_iters = Vec::with_capacity(snapshot.imm_memtables.len() + 1);
+        mem_iters.push(Box::new(snapshot.memtable.scan(_lower, _upper)));
         snapshot
             .imm_memtables
             .iter()
-            .for_each(|iter| iters.push(Box::new(iter.scan(_lower, _upper))));
+            .for_each(|iter| mem_iters.push(Box::new(iter.scan(_lower, _upper))));
+        let merge_mem_iter = MergeIterator::create(mem_iters);
 
-        let merge_iter = MergeIterator::create(iters);
+        let mut sst_iters = Vec::with_capacity(snapshot.l0_sstables.len());
+        for idx in snapshot.l0_sstables.iter() {
+            let sst = snapshot.sstables[idx].clone();
+            if Self::range_overlap(
+                _lower,
+                _upper,
+                sst.first_key().as_key_slice(),
+                sst.last_key().as_key_slice(),
+            ) {
+                match _lower {
+                    Bound::Included(key) => sst_iters.push(Box::new(
+                        SsTableIterator::create_and_seek_to_key(sst, Key::from_slice(key))?,
+                    )),
+                    Bound::Excluded(key) => {
+                        let mut iter =
+                            SsTableIterator::create_and_seek_to_key(sst, Key::from_slice(key))?;
+                        iter.next()?;
+                        sst_iters.push(Box::new(iter))
+                    }
+                    Bound::Unbounded => sst_iters.push(Box::new(
+                        SsTableIterator::create_and_seek_to_first(sst).unwrap(),
+                    )),
+                };
+            }
+        }
+        let merge_sst_iter = MergeIterator::create(sst_iters);
 
-        Ok(FusedIterator::new(LsmIterator::new(merge_iter)?))
+        Ok(FusedIterator::new(LsmIterator::new(
+            TwoMergeIterator::create(merge_mem_iter, merge_sst_iter)?,
+            map_bound(_upper),
+        )?))
+    }
+
+    fn range_overlap(
+        user_begin: Bound<&[u8]>,
+        user_end: Bound<&[u8]>,
+        table_begin: KeySlice,
+        table_end: KeySlice,
+    ) -> bool {
+        match user_end {
+            Bound::Included(end) => {
+                if end < table_begin.raw_ref() {
+                    return false;
+                }
+            }
+            Bound::Excluded(end) => {
+                if end <= table_begin.raw_ref() {
+                    return false;
+                }
+            }
+            _ => (),
+        }
+
+        match user_begin {
+            Bound::Included(begin) => {
+                if begin > table_end.raw_ref() {
+                    return false;
+                }
+            }
+            Bound::Excluded(begin) => {
+                if begin >= table_end.raw_ref() {
+                    return false;
+                }
+            }
+            _ => (),
+        }
+
+        true
     }
 }
