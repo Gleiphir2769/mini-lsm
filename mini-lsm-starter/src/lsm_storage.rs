@@ -1,13 +1,14 @@
 #![allow(dead_code)] // REMOVE THIS LINE after fully implementing this functionality
 
 use std::collections::HashMap;
+use std::fs::File;
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::process::id;
 use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{anyhow, bail, Result};
 use arc_swap::AsRaw;
 use bytes::Bytes;
 use parking_lot::{Mutex, MutexGuard, RwLock};
@@ -27,7 +28,7 @@ use crate::lsm_iterator::{FusedIterator, LsmIterator};
 use crate::manifest::Manifest;
 use crate::mem_table::{map_bound, MemTable};
 use crate::mvcc::LsmMvccInner;
-use crate::table::{SsTable, SsTableIterator};
+use crate::table::{SsTable, SsTableBuilder, SsTableIterator};
 
 pub type BlockCache = moka::sync::Cache<(usize, usize), Arc<Block>>;
 
@@ -162,7 +163,33 @@ impl Drop for MiniLsm {
 
 impl MiniLsm {
     pub fn close(&self) -> Result<()> {
-        unimplemented!()
+        // sync LSM dir
+        self.inner.sync_dir()?;
+        // send signal to trigger flush
+        self.flush_notifier.send(())?;
+        // wait for flush thread finish
+        let mut flush_guard = self.flush_thread.lock();
+        if let Some(flush_thread) = flush_guard.take() {
+            flush_thread.join().map_err(|e| anyhow!("{:?}", e))?;
+        }
+
+        // flush all immutable tables
+        if !self.inner.state.read().memtable.is_empty() {
+            self.inner
+                .freeze_memtable(Arc::new(MemTable::create(self.inner.next_sst_id())))?;
+        }
+
+        while {
+            let snapshot = self.inner.state.read();
+            !snapshot.imm_memtables.is_empty()
+        } {
+            self.inner.force_flush_next_imm_memtable()?;
+        }
+
+        // sync dir again
+        self.inner.sync_dir()?;
+
+        Ok(())
     }
 
     /// Start the storage engine by either loading an existing directory or creating a new one if the directory does
@@ -303,16 +330,20 @@ impl LsmStorageInner {
                 return Ok(Some(value));
             }
         }
-        
+
         // find k/v in sst
         let mut sst_iters = Vec::with_capacity(guard.l0_sstables.len());
         let key_slice = KeySlice::from_slice(_key);
         for idx in guard.l0_sstables.iter() {
             let sst = guard.sstables[idx].clone();
-            if sst.first_key().as_key_slice() <= key_slice || 
-                sst.last_key().as_key_slice() >= key_slice {
-                sst_iters.push(Box::new(
-                    SsTableIterator::create_and_seek_to_key(sst, key_slice)?));
+            if Self::key_within(
+                key_slice,
+                sst.first_key().as_key_slice(),
+                sst.last_key().as_key_slice(),
+            ) {
+                sst_iters.push(Box::new(SsTableIterator::create_and_seek_to_key(
+                    sst, key_slice,
+                )?));
             }
         }
         let iter = MergeIterator::create(sst_iters);
@@ -367,7 +398,8 @@ impl LsmStorageInner {
     }
 
     pub(super) fn sync_dir(&self) -> Result<()> {
-        unimplemented!()
+        File::open(&self.path)?.sync_all()?;
+        Ok(())
     }
 
     /// Force freeze the current memtable to an immutable memtable
@@ -406,7 +438,35 @@ impl LsmStorageInner {
 
     /// Force flush the earliest-created immutable memtable to disk
     pub fn force_flush_next_imm_memtable(&self) -> Result<()> {
-        unimplemented!()
+        let flush_memtable;
+        {
+            let guard = self.state.read();
+            flush_memtable = guard
+                .imm_memtables
+                .last()
+                .expect("no imm_memtable to flush")
+                .clone()
+        }
+
+        let mut sst_builder = SsTableBuilder::new(self.options.block_size);
+        flush_memtable.flush(&mut sst_builder)?;
+
+        let sst_id = flush_memtable.id();
+        let sst = sst_builder.build(sst_id, None, self.path_of_sst(sst_id))?;
+        {
+            let mut guard = self.state.write();
+            let mut snapshot = guard.as_ref().clone();
+            let mem = snapshot.imm_memtables.pop().unwrap();
+            assert_eq!(mem.id(), sst.sst_id());
+            snapshot.l0_sstables.insert(0, sst.sst_id());
+            snapshot.sstables.insert(sst.sst_id(), Arc::new(sst));
+            // update origin state
+            *guard = Arc::new(snapshot)
+        }
+
+        self.sync_dir()?;
+
+        Ok(())
     }
 
     pub fn new_txn(&self) -> Result<()> {
@@ -501,5 +561,9 @@ impl LsmStorageInner {
         }
 
         true
+    }
+
+    fn key_within(user_key: KeySlice, table_begin: KeySlice, table_end: KeySlice) -> bool {
+        user_key >= table_begin && user_key <= table_end
     }
 }
